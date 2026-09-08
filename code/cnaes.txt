@@ -1,0 +1,13 @@
+# Lista de CNAEs que o ETL deve trazer da base da Receita Federal.
+# Um codigo por linha. Pontuacao e ignorada, entao tanto faz 4683-4/00 ou 4683400.
+# Texto apos "#" e comentario.
+#
+# Codigo com 7 digitos  -> casa exatamente aquele CNAE.
+# Codigo com menos de 7 -> casa por prefixo (ex.: 4623 pega 4623106, 4623109, ...).
+
+4683400  # Comercio atacadista de defensivos agricolas, adubos, fertilizantes e corretivos do solo
+4623106  # Comercio atacadista de sementes, flores, plantas e gramas
+4789002  # Comercio varejista de plantas e flores naturais
+4661300  # Comercio atacadista de maquinas, aparelhos e equipamentos para uso agropecuario
+4771704  # Comercio varejista de medicamentos veterinarios
+4623109  # Comercio atacadista de alimentos para animais

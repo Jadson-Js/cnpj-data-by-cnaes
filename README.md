@@ -6,54 +6,172 @@ A Receita Federal do Brasil disponibiliza bases com os dados públicos do cadast
 
 De forma geral, nelas constam as mesmas informações que conseguimos ver no cartão do CNPJ, quando fazemos uma consulta individual, acrescidas de outros dados de Simples Nacional, sócios e etc. Análises muito ricas podem sair desses dados, desde econômicas, mercadológicas até investigações.
 
-Nesse repositório consta um processo de ETL para **i)** baixar os arquivos; **ii)** descompactar; **iii)** ler, tratar e **iv)** inserir num banco de dados relacional PostgreSQL.
+Nesse repositório consta um processo de ETL para **i)** baixar os arquivos; **ii)** filtrar
+pelos CNAEs de interesse; **iii)** montar um documento por CNPJ e **iv)** gravar no MongoDB.
+
+| Script | O que faz | Destino | Tempo típico |
+|---|---|---|---|
+| `code/ETL_cnae_filtrado.py` | Carrega apenas os CNPJs dos CNAEs que você escolher | MongoDB / NDJSON | ~25–30 min |
+
+### Infraestrutura necessária
+- Python 3.10+
+- MongoDB acessível (local ou remoto) — informado em `MONGO_URI`
+- ~10 GB livres em disco durante a execução
 
 ---------------------
 
-### Infraestrutura necessária:
-- [Python 3.8](https://www.python.org/downloads/release/python-3810/)
-- [PostgreSQL 14.2](https://www.postgresql.org/download/)
+## ETL filtrado por CNAE (`ETL_cnae_filtrado.py`)
 
----------------------
+Feito para quem precisa só de um recorte da base: informe uma lista de CNAEs e o
+processo traz apenas os CNPJs daquelas atividades, com **razão social, nome do
+proprietário, CNPJ, telefone, e-mail e endereço completo**, já como documentos prontos
+para o MongoDB.
 
-### How to use:
-1. Com o Postgres instalado, inicie a instância do servidor (pode ser local) e crie o banco de dados conforme o arquivo `banco_de_dados.sql`.
+### Por que é muito mais rápido
 
-2. Crie um arquivo `.env` no diretório `code`, conforme as variáveis de ambiente do seu ambiente de trabalho (localhost). Utilize como referência o arquivo `.env_template`. Você pode também, por exemplo, renomear o arquivo de `.env_template` para apenas `.env` e então utilizá-lo:
-   - `OUTPUT_FILES_PATH`: diretório de destino para o donwload dos arquivos
-   - `EXTRACTED_FILES_PATH`: diretório de destino para a extração dos arquivos .zip
-   - `DB_USER`: usuário do banco de dados criado pelo arquivo `banco_de_dados.sql`
-   - `DB_PASSWORD`: senha do usuário do BD
-   - `DB_HOST`: host da conexão com o BD
-   - `DB_PORT`: porta da conexão com o BD
-   - `DB_NAME`: nome da base de dados na instância (`Dados_RFB` - conforme arquivo `banco_de_dados.sql`)
+- **Filtra antes de gravar**: as linhas são descartadas durante a leitura do CSV, então só o
+  recorte é processado (o processo antigo carregava ~74 milhões de estabelecimentos
+  para depois filtrar).
+- **Não descompacta nada em disco**: os CSVs são lidos de dentro do `.zip` em streaming.
+  Some a etapa de extrair ~25 GB.
+- **Não baixa o que não é usado**: `Simples.zip` é ignorado.
+- **Paralelismo**: downloads simultâneos e filtragem multi-processo; o filtro de um arquivo
+  já começa enquanto os outros ainda estão baixando.
 
-3. Instale as bibliotecas necessárias, disponíveis em `requirements.txt`:
+### Onde cada etapa roda
+
+A fase pesada (download, filtragem, joins) foi desenhada para rodar numa **instância
+separada** — sua máquina ou uma VM descartável. O servidor de produção não vê os `.zip`,
+não descompacta nada e não roda pandas: ele só recebe os documentos prontos.
+
+Duas formas de entregar, e as duas podem ser usadas ao mesmo tempo:
+
+- **`MONGO_URI`** — a própria instância que fez a mineração insere direto na collection.
+  `mongoimport`/pymongo são clientes: não precisam rodar no servidor, basta alcançá-lo.
+- **`EXPORT_NDJSON_PATH`** — gera um `.ndjson.gz` (um documento por linha, formato nativo
+  do `mongoimport`). Útil quando a instância não alcança o Mongo: você transfere o arquivo
+  e importa de onde quiser.
+
+```bash
+mongoimport --uri "mongodb://usuario:senha@host:27017/meubanco?authSource=admin" \
+            --collection reseller_shop --type json \
+            --gzip --file data/empresas_cnae.ndjson.gz \
+            --mode upsert --numInsertionWorkers 2
+```
+
+`--mode upsert` porque o `_id` de cada documento é o próprio CNPJ: reimportar atualiza em
+vez de duplicar. `--numInsertionWorkers 2` segura a carga no servidor.
+
+Medido nesta base, numa máquina de 12 núcleos:
+
+| Fase | Tempo | Taxa medida |
+|---|---:|---|
+| Download de 7,4 GB (4 conexões) | ~21 min | 5,9 MB/s agregados |
+| Filtrar 72,8 M estabelecimentos | ~3–4 min | 0,20–0,35 M linhas/s por processo |
+| Filtrar empresas + sócios | ~2–3 min | — |
+| Montar os documentos | ~26 s | 26.000 docs/s |
+| Inserir no Mongo + índices | ~110 s | 7.000 docs/s |
+
+O download domina, e a filtragem roda em paralelo com ele. Não adianta subir
+`DOWNLOAD_WORKERS` acima de 4: com 8 conexões o servidor da Receita começa a dar timeout.
+Reexecutando com os `.zip` já em disco são ~6–8 min; com as partes filtradas em cache
+(mesma lista de CNAEs), só a montagem e a carga, ~2,5 min.
+
+### Como usar
+
+1. Copie `code/.env_template` para `code/.env` e ajuste as variáveis: diretórios, opções de
+   filtro/performance e pelo menos uma saída (`MONGO_URI` e/ou `EXPORT_NDJSON_PATH`).
+
+2. Coloque a sua lista de CNAEs em `code/cnaes.txt` (um por linha) e/ou em `CNAE_LIST` no
+   `.env`. Pontuação é ignorada, então `5611-2/01` e `5611201` são equivalentes:
+   - código com **7 dígitos** → casa exatamente aquele CNAE;
+   - código com **menos de 7 dígitos** → casa por prefixo (`5611` pega `5611201`, `5611202`,
+     `5611203`; `62` pega todo o grupo de TI).
+
+3. Instale as dependências e execute:
 ```
 pip install -r requirements.txt
+python code/ETL_cnae_filtrado.py
 ```
 
-4. Execute o arquivo `ETL_coletar_dados_e_gravar_BD.py` e aguarde a finalização do processo.
-   - Os arquivos são grandes. Dependendo da infraestrutura isso deve levar muitas horas para conclusão.
-   - Arquivos de 08/05/2021: `4,68 GB` compactados e `17,1 GB` descompactados.
+### Opções principais do `.env`
+
+| Variável | Padrão | Para que serve |
+|---|---|---|
+| `CNAE_LIST` / `CNAE_ARQUIVO` | `code/cnaes.txt` | Lista de CNAEs alvo |
+| `CNAE_INCLUIR_SECUNDARIA` | `1` | Também traz quem tem o CNAE como atividade secundária |
+| `UF_LIST` | vazio | Restringe por UF (ex.: `SP,MG`) |
+| `SITUACAO_CADASTRAL` | vazio | Ex.: `02` para trazer só empresas ativas |
+| `PROC_WORKERS` | `6` | Processos de filtragem em paralelo |
+| `DOWNLOAD_WORKERS` | `4` | Downloads simultâneos |
+| `APAGAR_ZIPS` | `0` | `1` apaga cada `.zip` depois de filtrar (economiza disco) |
+| `REPROCESSAR` | `0` | `1` ignora o cache e refaz a filtragem |
+| `EXPORT_NDJSON_PATH` | `data/empresas_cnae.ndjson.gz` | Arquivo NDJSON gerado (`0` = não gera) |
+| `MONGO_URI` | vazio | Se preenchido, insere direto na collection |
+| `MONGO_DB` | banco da URI | Sobrescreve o banco de destino |
+| `MONGO_COLLECTION` | `reseller_shop` | Collection de destino |
+| `MONGO_BATCH` | `5000` | Documentos por `insert_many` |
+| `MONGO_SWAP` | `1` | Carrega numa collection temporária e só troca no fim |
+
+O processo é **retomável**: cada `.zip` já filtrado ganha um marcador em
+`data/partes_filtradas/`. Se você rodar de novo com a **mesma** lista de CNAEs, ele pula o
+que já foi feito; se a lista mudar, ele refaz automaticamente.
+
+### Resultado
+
+Um documento por estabelecimento, com empresa, sócios e descrições de domínio já
+resolvidos — nada de código numérico solto ou join pendente. O `_id` é o próprio CNPJ:
+
+```js
+{
+  "_id": "11111111000101",
+  "cnpj_formatado": "11.111.111/0001-01",
+  "razao_social": "ZE ALIMENTOS LTDA",
+  "nome_fantasia": "PADARIA DO ZE",
+  "nome_proprietario": "ZE ADMINISTRADOR",
+  "qualificacao_proprietario": "Sócio-Administrador",
+  "socios": [
+    { "nome": "ZE ADMINISTRADOR", "qualificacao": "Sócio-Administrador",
+      "qualificacao_codigo": "49", "cpf_cnpj": "***333444**",
+      "data_entrada": ISODate("2010-03-15T00:00:00Z") }
+  ],
+  "telefone_1": "(11) 999998888",
+  "email": "contato@ze.com.br",
+  "endereco_completo": "RUA DAS FLORES 100, SALA 2, CENTRO, SÃO PAULO/SP, CEP 01310-100",
+  "endereco": { "logradouro": "DAS FLORES", "bairro": "CENTRO", "cep": "01310100",
+                "municipio": "SÃO PAULO", "uf": "SP", "...": "..." },
+  "cnae_principal": { "codigo": "5611201", "descricao": "Restaurantes e similares" },
+  "cnae_secundarios": [ { "codigo": "4712100", "descricao": "Minimercados..." } ],
+  "situacao_cadastral": "Ativa",
+  "matriz_filial": "Matriz",
+  "data_inicio_atividade": ISODate("2010-03-15T00:00:00Z"),
+  "porte_empresa": "Empresa de pequeno porte",
+  "natureza_juridica": "Sociedade Empresária Limitada",
+  "capital_social": 150000.0
+}
+```
+
+`socios` e `cnae_secundarios` são **arrays de subdocumentos** — dá para consultar com
+`$elemMatch` em vez de fazer `LIKE` numa string concatenada. Datas são `ISODate` e
+`capital_social` é numérico, então filtros de intervalo funcionam direto:
+
+```js
+db.reseller_shop.find({
+  "endereco.uf": "SP",
+  "situacao_cadastral": "Ativa",
+  "cnae_principal.codigo": "5611201"
+})
+```
+
+Índices criados **depois** da carga (construí-los durante o insert é o que pesa no
+servidor): `cnpj_basico`, `cnae_principal.codigo`, `endereco.uf + endereco.municipio` e
+`situacao_cadastral`.
+
+`nome_proprietario` usa o sócio de maior relevância (titular, sócio-administrador,
+administrador, presidente, diretor, nessa ordem) e cai para a razão social quando a empresa
+é um empresário individual / MEI, que não tem quadro societário.
+
+Com `MONGO_SWAP=1` (padrão) a carga vai para uma collection temporária e só troca pela
+definitiva no final, então a aplicação nunca lê dados pela metade.
 
 ---------------------
-
-### Tabelas geradas:
-- Para maiores informações, consulte o [layout](https://www.gov.br/receitafederal/pt-br/assuntos/orientacao-tributaria/cadastros/consultas/arquivos/NOVOLAYOUTDOSDADOSABERTOSDOCNPJ.pdf).
-  - `empresa`: dados cadastrais da empresa em nível de matriz
-  - `estabelecimento`: dados analíticos da empresa por unidade / estabelecimento (telefones, endereço, filial, etc)
-  - `socios`: dados cadastrais dos sócios das empresas
-  - `simples`: dados de MEI e Simples Nacional
-  - `cnae`: código e descrição dos CNAEs
-  - `quals`: tabela de qualificação das pessoas físicas - sócios, responsável e representante legal.
-  - `natju`: tabela de naturezas jurídicas - código e descrição.
-  - `moti`: tabela de motivos da situação cadastral - código e descrição.
-  - `pais`: tabela de países - código e descrição.
-  - `munic`: tabela de municípios - código e descrição.
-
-
-- Pelo volume de dados, as tabelas  `empresa`, `estabelecimento`, `socios` e `simples` possuem índices para a coluna `cnpj_basico`, que é a principal chave de ligação entre elas.
-
-### Modelo de Entidade Relacionamento:
-![alt text](https://github.com/aphonsoar/Receita_Federal_do_Brasil_-_Dados_Publicos_CNPJ/blob/master/Dados_RFB_ERD.png)

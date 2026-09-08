@@ -110,9 +110,8 @@ ENV/
 env.bak/
 venv.bak/
 
-# Dados baixados/extraídos da Receita Federal e volumes do Postgres
+# Dados baixados/filtrados da Receita Federal
 /data/
-/pgdata/
 
 # Spyder project settings
 .spyderproject
