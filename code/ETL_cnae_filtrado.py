@@ -11,7 +11,6 @@ e/ou direto para uma collection do MongoDB. A fase pesada roda inteira aqui, num
 instancia separada; o servidor de producao so recebe os documentos prontos.
 """
 
-import datetime
 import gzip
 import hashlib
 import os
@@ -309,7 +308,6 @@ def carregar_dominios(zips_por_nome):
 # --------------------------------------------------------------------------- #
 SITUACAO = {'01': 'Nula', '02': 'Ativa', '03': 'Suspensa', '04': 'Inapta', '08': 'Baixada'}
 PORTE = {'01': 'Micro empresa', '03': 'Empresa de pequeno porte', '05': 'Demais'}
-MATRIZ_FILIAL = {'1': 'Matriz', '2': 'Filial'}
 
 # Naturezas de titular unico: nao ha registro em Socios, o proprietario e a
 # propria razao social (empresario individual, EIRELI, produtor rural).
@@ -318,25 +316,6 @@ NATJU_TITULAR = frozenset({'2135', '2305', '4014'})
 # Ordem de preferencia para eleger o socio "principal" do estabelecimento.
 PRIORIDADE_QUAL = {'65': 0, '49': 1, '05': 2, '16': 3, '10': 4, '22': 5}
 PRIORIDADE_PADRAO = 9
-
-
-def _juntar(sep, *partes):
-    return sep.join(p for p in partes if p) or None
-
-
-def _data(bruto):
-    if len(bruto) != 8 or bruto[0] not in '12' or not bruto.isdigit():
-        return None
-    try:
-        return datetime.datetime.strptime(bruto, '%Y%m%d')
-    except ValueError:
-        return None
-
-
-def formatar_cnpj(cnpj):
-    if len(cnpj) != 14:
-        return None
-    return f'{cnpj[:2]}.{cnpj[2:5]}.{cnpj[5:8]}/{cnpj[8:12]}-{cnpj[12:]}'
 
 
 def _telefone(ddd, numero):
@@ -384,7 +363,7 @@ def carregar_socios(arquivos):
     return df.set_index('cnpj_basico')
 
 
-def socios_do_bloco(socios, chaves, quals):
+def socios_do_bloco(socios, chaves):
     """Agrupa os socios dos cnpj_basico do bloco em listas de subdocumentos."""
     if socios.empty:
         return {}
@@ -394,59 +373,40 @@ def socios_do_bloco(socios, chaves, quals):
 
     sub = socios.loc[presentes]
     agrupado = {}
-    for basico, nome, qual, cpf, entrada in zip(
-            sub.index, sub['nome_socio_razao_social'], sub['qualificacao_socio'],
-            sub['cpf_cnpj_socio'], sub['data_entrada_sociedade']):
-        agrupado.setdefault(basico, []).append({
-            'nome': nome or None,
-            'qualificacao': quals.get(qual.zfill(2)) if qual else None,
-            'qualificacao_codigo': qual.zfill(2) if qual else None,
-            'cpf_cnpj': cpf or None,
-            'data_entrada': _data(entrada),
-        })
+    for basico, nome in zip(sub.index, sub['nome_socio_razao_social']):
+        if nome:
+            agrupado.setdefault(basico, []).append({'nome': nome})
     return agrupado
 
 
 def montar_documentos(bloco, empresas, socios, dominios):
     """Une estabelecimento + empresa + socios + dominios num documento por CNPJ."""
     cnae, munic = dominios['cnae'], dominios['munic']
-    natju, quals = dominios['natju'], dominios['quals']
 
     bloco = bloco.join(empresas, on='cnpj_basico')
     textuais = [c for c in SAIDA_EMPRESA if c not in ('cnpj_basico', 'capital_social')]
     bloco[textuais] = bloco[textuais].fillna('')
-    por_cnpj = socios_do_bloco(socios, bloco['cnpj_basico'].to_numpy(), quals)
+    por_cnpj = socios_do_bloco(socios, bloco['cnpj_basico'].to_numpy())
 
     documentos = []
     for linha in bloco.itertuples(index=False):
         lista_socios = por_cnpj.get(linha.cnpj_basico, [])
         if lista_socios:
             proprietario = lista_socios[0]['nome']
-            qualificacao = lista_socios[0]['qualificacao']
         elif linha.natureza_juridica in NATJU_TITULAR:
-            proprietario, qualificacao = linha.razao_social or None, None
+            proprietario = linha.razao_social or None
         else:
-            proprietario = qualificacao = None
-
-        municipio = munic.get(linha.municipio)
-        logradouro = _juntar(' ', linha.tipo_logradouro, linha.logradouro, linha.numero)
-        cep = f'CEP {linha.cep[:5]}-{linha.cep[5:]}' if len(linha.cep) == 8 else None
+            proprietario = None
 
         documentos.append({
             '_id': linha.cnpj,
             'cnpj': linha.cnpj,
-            'cnpj_formatado': formatar_cnpj(linha.cnpj),
-            'cnpj_basico': linha.cnpj_basico,
             'razao_social': linha.razao_social or None,
             'nome_fantasia': linha.nome_fantasia or None,
             'nome_proprietario': proprietario,
-            'qualificacao_proprietario': qualificacao,
             'socios': lista_socios,
             'telefone_1': _telefone(linha.ddd_1, linha.telefone_1),
-            'telefone_2': _telefone(linha.ddd_2, linha.telefone_2),
             'email': linha.correio_eletronico.lower() or None,
-            'endereco_completo': _juntar(', ', logradouro, linha.complemento, linha.bairro,
-                                         _juntar('/', municipio, linha.uf), cep),
             'endereco': {
                 'tipo_logradouro': linha.tipo_logradouro or None,
                 'logradouro': linha.logradouro or None,
@@ -454,8 +414,7 @@ def montar_documentos(bloco, empresas, socios, dominios):
                 'complemento': linha.complemento or None,
                 'bairro': linha.bairro or None,
                 'cep': linha.cep or None,
-                'municipio': municipio,
-                'municipio_codigo': linha.municipio or None,
+                'municipio': munic.get(linha.municipio),
                 'uf': linha.uf or None,
             },
             'cnae_principal': {
@@ -463,13 +422,8 @@ def montar_documentos(bloco, empresas, socios, dominios):
                 'descricao': cnae.get(linha.cnae_fiscal_principal),
             },
             'cnae_secundarios': _cnaes_secundarios(linha.cnae_fiscal_secundaria, cnae),
-            'matriz_filial': MATRIZ_FILIAL.get(linha.identificador_matriz_filial),
             'situacao_cadastral': SITUACAO.get(linha.situacao_cadastral.zfill(2)),
-            'data_situacao_cadastral': _data(linha.data_situacao_cadastral),
-            'data_inicio_atividade': _data(linha.data_inicio_atividade),
             'porte_empresa': PORTE.get(linha.porte_empresa.zfill(2)),
-            'natureza_juridica': natju.get(linha.natureza_juridica),
-            'natureza_juridica_codigo': linha.natureza_juridica or None,
             'capital_social': None if pd.isna(linha.capital_social) else float(linha.capital_social),
         })
     return documentos
@@ -533,6 +487,21 @@ def inserir_mongo(documentos, uri, nome_db, nome_colecao, lote, swap):
         db[destino].rename(nome_colecao, dropTarget=True)
     cliente.close()
     return total
+
+
+def limpar_temporarios(caminhos):
+    """Apaga os .zip baixados e os CSVs intermediarios depois da carga."""
+    liberado = 0
+    for caminho in caminhos:
+        if caminho and os.path.isfile(caminho):
+            liberado += os.path.getsize(caminho)
+            os.remove(caminho)
+    for pasta in {os.path.dirname(c) for c in caminhos if c}:
+        try:
+            os.rmdir(pasta)
+        except OSError:
+            pass  # sobrou algo que nao foi este processo que criou
+    return liberado
 
 
 # --------------------------------------------------------------------------- #
@@ -599,6 +568,7 @@ def main():
     dl_workers = int(env('DOWNLOAD_WORKERS', '4'))
     apagar_zips = env_bool('APAGAR_ZIPS', False)
     reprocessar = env_bool('REPROCESSAR', False)
+    limpar = env_bool('LIMPAR_TEMPORARIOS', True)
     ndjson_path = env('EXPORT_NDJSON_PATH',
                       str(pathlib.Path(zips_dir).parent / 'empresas_cnae.ndjson.gz'))
     if ndjson_path.strip().lower() in ('0', 'nao', 'no', 'false'):
@@ -738,6 +708,16 @@ def main():
         log(f'NDJSON: {ndjson_path} ({os.path.getsize(ndjson_path) / 1e6:.0f} MB)')
     if mongo_uri:
         log(f'MongoDB: collection {mongo_colecao} pronta')
+
+    if limpar:
+        descartaveis = [caminho_de[n] for n in necessarios]
+        descartaveis += [parte(n) for n in necessarios]
+        descartaveis += [npy(n) for n in necessarios]
+        descartaveis += [marcador_de[n] for n in necessarios]
+        descartaveis.append(npy_alvo)
+        liberado = limpar_temporarios(descartaveis)
+        log(f'temporarios apagados: {liberado / 1e9:.1f} GB liberados')
+
     log(f'concluido em {round(time.time() - inicio)}s')
 
 
